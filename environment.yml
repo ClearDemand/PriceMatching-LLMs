@@ -1,6 +1,8 @@
 name: pm-llms
 channels:
   - defaults
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
 dependencies:
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
@@ -222,4 +224,4 @@ dependencies:
       - widgetsnbextension==4.0.14
       - xyzservices==2025.4.0
       - zipp==3.22.0
-prefix: /home/egharibnezhad/anaconda3/envs/pm-llms
+prefix: /home/egharibnezhad/apps/anaconda3/envs/pm-llms
