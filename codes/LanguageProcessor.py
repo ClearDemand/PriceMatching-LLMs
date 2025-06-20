@@ -11,6 +11,7 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity as sk_cosine_similarity
 
 from sentence_transformers import SentenceTransformer, util
+import hnswlib
 
 # Ensure stopwords are available
 nltk.download('stopwords')
@@ -48,21 +49,72 @@ class LanguageProcessor:
         self.semantic_weight = 1 - lexical_weight
         self.model = SentenceTransformer(self.model_name)
 
-    def load_data(self, filepath, n_rows=-1, __print__=True):
+    def load_data(self, 
+                filepath: str, 
+                col_a: list = ['sentence1'], 
+                col_b: list = ['sentence2'], 
+                score_col: str = 'score', 
+                n_rows: int = -1, 
+                sep: str = ' ',
+                __print__: bool = True):
         """
-        Load the client dataset from CSV file.
+        Load dataset from CSV or Parquet and prepare Catalog A and Catalog B for text comparison.
 
         Args:
-            filepath (str): Path to the CSV file containing 'sentence1', 'sentence2', 'score'.
-            n_rows (int): Number of rows to load for analysis, default is all.
+            filepath (str): Path to CSV (.csv) or Parquet (.parquet) file.
+            col_a (list): List of columns to combine for catalog A.
+            col_b (list): List of columns to combine for catalog B.
+            score_col (str): Column name for similarity scores.
+            n_rows (int): Number of rows to load. Default is all.
+            sep (str): Separator for combining columns.
+            __print__ (bool): Whether to print sample after loading.
         """
-        df = pd.read_csv(filepath)
-        self.catalog_a = df['sentence1'][:n_rows].tolist()
-        self.catalog_b = df['sentence2'][:n_rows].tolist()
-        self.ref_score = df['score'][:n_rows].tolist()
+        # Auto-detect file type
+        if filepath.endswith('.csv'):
+            df = pd.read_csv(filepath)
+        elif filepath.endswith('.parquet'):
+            df = pd.read_parquet(filepath)
+        else:
+            raise ValueError("Unsupported file format. Only .csv and .parquet are supported.")
+        
+        if n_rows != -1:
+            df = df.head(n_rows)
+
+        # Combine columns
+        df['catalog_a_text'] = self.combine_columns(df, col_a, sep=sep, new_col_name='catalog_a_text')
+        df['catalog_b_text'] = self.combine_columns(df, col_b, sep=sep, new_col_name='catalog_b_text')
+
+        # Save to object
+        self.catalog_a = df['catalog_a_text'].tolist()
+        self.catalog_b = df['catalog_b_text'].tolist()
+        self.ref_score = df[score_col].tolist()
         self.df = df
+
         if __print__:
-            display(df.head(5))
+            print(f"\n✅ Loaded {len(df)} rows from: {filepath}")
+            print(f"Catalog A columns: {col_a}")
+            print(f"Catalog B columns: {col_b}")
+            print(f"Score column: {score_col}\n")
+            display(df[['catalog_a_text', 'catalog_b_text', score_col]].head(5))
+
+    
+    def combine_columns(self, df: pd.DataFrame, 
+                        columns: list, sep: str = ' ', new_col_name: str = 'combined_text'):
+        """
+        Combine multiple columns into a single text column.
+
+        Args:
+            df (pd.DataFrame): The dataframe.
+            columns (list): List of columns to combine.
+            sep (str): Separator between column values.
+            new_col_name (str): Name of the new combined column.
+
+        Returns:
+            pd.Series: The combined text column.
+        """
+        df[new_col_name] = df[columns].fillna('').astype(str).apply(lambda row: sep.join(row), axis=1)
+        return df[new_col_name]
+
     
     def tokenizer(self, text):
         """
@@ -342,10 +394,16 @@ class LanguageProcessor:
     
             # Encode with model (returns tensors)
             embeddings = self.model.encode(text_list_clean, convert_to_tensor=True)
-    
+
+            # Move to CPU and convert each row to numpy array
+            embeddings_cpu = embeddings.cpu()
+
             # Add embeddings column to df
-            df[f"{col}_embedding"] = list(embeddings)
+            # df[f"{col}_embedding"] = list(embeddings_cpu)
     
+            # Convert to list of numpy arrays (one per row)
+            df[f"{col}_embedding"] = [emb.numpy() for emb in embeddings_cpu]
+
             print(f"Added embeddings for column '{col}' as '{col}_embedding'")
     
         self.df = df
@@ -385,10 +443,6 @@ class LanguageProcessor:
             max_label_len (int): Max length of text labels.
             title (str): Plot title.
         """
-        import numpy as np
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        from sklearn.decomposition import PCA
     
         if df is None:
             df = self.df
@@ -732,6 +786,163 @@ class LanguageProcessor:
         plt.show()
 
 
+
+    # find me!
+
+
+    
+    ###### FIND ME
+    def compute_knn_similarity(self,
+                               emb_col_a: str,
+                               emb_col_b: str,
+                               raw_col_a: str = None,
+                               raw_col_b: str = None,
+                               top_k: int = 5,
+                               space: str = 'cosine',  # or 'l2'
+                               ef_construction: int = 200,
+                               M: int = 16,
+                               __print__: bool = True,
+                               __plot__: bool = True
+                              ) -> pd.DataFrame:
+        """
+        Compute KNN similarity between two embedding columns using HNSWlib.
+        
+        Args:
+            emb_col_a (str): Name of embedding column for Catalog A (query).
+            emb_col_b (str): Name of embedding column for Catalog B (index).
+            raw_col_a (str, optional): Raw text column for Catalog A (display).
+            raw_col_b (str, optional): Raw text column for Catalog B (display).
+            top_k (int): Number of neighbors to retrieve.
+            space (str): Similarity space ('cosine' or 'l2').
+            ef_construction (int): HNSWlib parameter (higher = more accurate).
+            M (int): HNSWlib parameter controlling graph connectivity.
+            __print__ (bool): Whether to print results.
+            __plot__ (bool): Whether to plot heatmap.
+        
+        Returns:
+            pd.DataFrame: DataFrame with columns:
+                ['index_a', 'index_b', 'catalog_a', 'catalog_b', 'similarity']
+        """
+        if not hasattr(self, 'df'):
+            raise ValueError("self.df not found. You must first load a dataframe with embeddings.")
+    
+        df = self.df
+    
+        # Load embeddings
+        embeddings_a = df[emb_col_a].tolist()
+        embeddings_b = df[emb_col_b].tolist()
+    
+        # Convert to numpy arrays
+        emb_a_np = np.array([e.cpu().numpy() if hasattr(e, 'cpu') else np.array(e) for e in embeddings_a])
+        emb_b_np = np.array([e.cpu().numpy() if hasattr(e, 'cpu') else np.array(e) for e in embeddings_b])
+    
+        dim = emb_b_np.shape[1]
+    
+        # Build HNSW index
+        index = hnswlib.Index(space=space, dim=dim)
+        index.init_index(max_elements=len(emb_b_np), ef_construction=ef_construction, M=M)
+        index.add_items(emb_b_np)
+        index.set_ef(ef_construction)
+    
+        # Search
+        labels, distances = index.knn_query(emb_a_np, k=top_k)
+    
+        # Prepare raw text
+        raw_col_a = raw_col_a if raw_col_a else emb_col_a.replace("_embedding", "")
+        raw_col_b = raw_col_b if raw_col_b else emb_col_b.replace("_embedding", "")
+    
+        catalog_a_raw = df[raw_col_a].astype(str).tolist() if raw_col_a in df.columns \
+                        else [f"A_{i}" for i in range(len(emb_a_np))]
+        catalog_b_raw = df[raw_col_b].astype(str).tolist() if raw_col_b in df.columns \
+                        else [f"B_{i}" for i in range(len(emb_b_np))]
+    
+        # Convert distances → similarity
+        if space == 'cosine':
+            sim_scores = 1.0 - distances
+        elif space == 'l2':
+            sim_scores = -distances  # optional: invert L2 for ranking
+        else:
+            raise ValueError(f"Unknown space: {space}")
+    
+        # Build result DataFrame
+        results = []
+        for i, (neighbor_indices, scores) in enumerate(zip(labels, sim_scores)):
+            for j, (neighbor_idx, score) in enumerate(zip(neighbor_indices, scores)):
+                results.append({
+                    "index_a": i,
+                    "index_b": neighbor_idx,
+                    "catalog_a": catalog_a_raw[i],
+                    "catalog_b": catalog_b_raw[neighbor_idx],
+                    "similarity": score
+                })
+    
+        df_knn_sim = pd.DataFrame(results)
+    
+        # Save for later use (plotting)
+        self.df_knn_sim = df_knn_sim
+        self.raw_col_a = raw_col_a
+        self.raw_col_b = raw_col_b
+    
+        if __print__:
+            display(df_knn_sim.head())
+    
+        if __plot__:
+            self.show_knn_similarity_heatmap()
+    
+        return df_knn_sim
+
+
+    def show_knn_similarity_heatmap(self,
+                                    df_knn_sim: pd.DataFrame = None,
+                                    max_label_len: int = 40,
+                                    figsize: tuple = (10, 6),
+                                    annot: bool = True,
+                                    cmap: str = "YlGnBu",
+                                    save_path: str = None
+                                ):
+        """
+        Plot a heatmap of KNN similarity scores.
+
+        Args:
+            df_knn_sim (pd.DataFrame, optional): If None, uses self.df_knn_sim.
+        """
+        if df_knn_sim is None:
+            if hasattr(self, 'df_knn_sim'):
+                df_knn_sim = self.df_knn_sim
+            else:
+                raise ValueError("You must run `compute_knn_similarity()` first.")
+
+        # Truncate labels
+        def truncate(text, max_len=max_label_len):
+            return text if len(text) <= max_len else text[:max_len] + "..."
+
+        # Pivot matrix: for display, pick top 1 per A
+        top1_df = df_knn_sim[df_knn_sim.groupby("index_a").similarity.transform("max") == df_knn_sim.similarity]
+
+        pivot_df = top1_df.pivot(index="index_a", columns="index_b", values="similarity").values
+
+        labels_a = [truncate(text) for text in top1_df["catalog_a"]]
+        labels_b = [truncate(text) for text in top1_df["catalog_b"]]
+
+        plt.figure(figsize=figsize)
+        sns.heatmap(pivot_df, annot=annot, fmt=".2f", cmap=cmap,
+                    xticklabels=labels_b, yticklabels=labels_a, linewidths=0.5)
+
+        plt.title("KNN Similarity Heatmap (HNSWlib)", fontsize=14)
+        plt.xlabel(f"{self.raw_col_b}")
+        plt.ylabel(f"{self.raw_col_a}")
+        plt.xticks(rotation=45, ha="right")
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=600)
+            print(f"✅ KNN similarity heatmap saved to: {save_path}")
+
+        plt.show()
+
+
+    
     def save_matches_to_csv(self, filepath='matched_results.csv'):
         """
         Save matched product pairs with similarity scores to a CSV file.
